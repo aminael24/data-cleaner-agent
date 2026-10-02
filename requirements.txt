@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+python-dotenv
+groq
+langgraph
+openpyxl
+xlrd
