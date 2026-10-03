@@ -1,1455 +1,280 @@
+from __future__ import annotations
+
 import json
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
-from agent.groq_client import (
-    SYSTEM_PROMPT,
-    call_agent_model,
-    create_client,
-)
-
+from agent.baseline import build_baseline, finalize_plan, summarize_actions
+from agent.groq_client import SYSTEM_PROMPT, call_agent_model, create_client
+from agent.preaudit import build_requirements, digest_summary, scan_dataset
 from agent.state import AgentState
-
-from agent.tools import (
-    ToolRuntime,
-    execute_tool,
-)
+from agent.tools import ToolRuntime, execute_tool
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-MAX_AGENT_TURNS = 10
+MAX_AGENT_TURNS = 5          # le LLM n'a plus qu'une petite revue sémantique à faire
+MAX_EVIDENCE_CHARS = 2500
+MEMORY_RESULT_CHARS = 800
+UI_RESULT_CHARS = 800
 
-# On évite de renvoyer des dizaines de milliers
-# de caractères au LLM.
-MAX_EVIDENCE_CHARS = 4200
+TASK_MESSAGE = (
+    "Review CATEGORICAL FORMS below. Submit ONLY extra replace_values actions for synonyms, "
+    "codes or translations that the baseline cannot know. Empty list if nothing is needed."
+)
 
 
 # ============================================================
-# ASSISTANT MESSAGE
+# HELPERS
 # ============================================================
 
-def _assistant_message_to_dict(
-    message,
-):
-
-    payload = {
-        "role":
-            "assistant",
-
-        "content":
-            message.content
-            or "",
-    }
-
-
-    tool_calls = (
-        getattr(
-            message,
-            "tool_calls",
-            None,
-        )
-        or []
-    )
-
-
+def _assistant_message_to_dict(message) -> dict:
+    payload = {"role": "assistant", "content": message.content or ""}
+    tool_calls = getattr(message, "tool_calls", None) or []
     if tool_calls:
-
-        payload[
-            "tool_calls"
-        ] = []
-
-
-        for tool_call in (
-            tool_calls
-        ):
-
-            payload[
-                "tool_calls"
-            ].append(
-                {
-                    "id":
-                        tool_call.id,
-
-                    "type":
-                        "function",
-
-                    "function":
-                        {
-                            "name":
-                                tool_call
-                                .function
-                                .name,
-
-                            "arguments":
-                                tool_call
-                                .function
-                                .arguments,
-                        },
-                }
-            )
-
-
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+            }
+            for call in tool_calls
+        ]
     return payload
 
 
-# ============================================================
-# COMPACT TOOL RESULT
-# ============================================================
+def _head(value, n):
+    return (value or [])[:n]
 
-def _compact_tool_result(
-    tool_name,
-    result,
-):
-    """
-    Réduit uniquement ce qui est envoyé au LLM.
 
-    IMPORTANT :
-    les outils continuent d'analyser
-    le DataFrame complet.
-
-    On réduit uniquement la représentation
-    textuelle retournée au modèle.
-    """
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-
+def _compact_tool_result(tool_name: str, result: Any):
+    if not isinstance(result, dict):
         return result
 
-
-    # ========================================================
-    # PROFILE DATASET
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "profile_dataset"
-    ):
-
-        compact_columns = []
-
-
-        for column in (
-            result.get(
-                "columns",
-                []
-            )
-            or []
-        ):
-
-            compact_column = {
-                "name":
-                    column.get(
-                        "name"
-                    ),
-
-                "dtype":
-                    column.get(
-                        "dtype"
-                    ),
-
-                "missing_count":
-                    column.get(
-                        "missing_count",
-                        0,
-                    ),
-
-                "unique_count":
-                    column.get(
-                        "unique_count",
-                        0,
-                    ),
-
-                "whitespace_count":
-                    column.get(
-                        "whitespace_count",
-                        0,
-                    ),
-
-                "null_like_count":
-                    column.get(
-                        "null_like_count",
-                        0,
-                    ),
-
-                "numeric_candidate_ratio":
-                    column.get(
-                        "numeric_candidate_ratio",
-                        0,
-                    ),
-
-                "date_candidate_ratio":
-                    column.get(
-                        "date_candidate_ratio",
-                        0,
-                    ),
-            }
-
-
-            # seulement quelques exemples
-            samples = (
-                column.get(
-                    "sample_values",
-                    []
-                )
-                or []
-            )
-
-
-            if samples:
-
-                compact_column[
-                    "sample_values"
-                ] = samples[:3]
-
-
-            # stats numériques utiles
-            for key in (
-                "min",
-                "max",
-                "mean",
-                "negative_count",
-            ):
-
-                if key in column:
-
-                    compact_column[
-                        key
-                    ] = column[
-                        key
-                    ]
-
-
-            compact_columns.append(
-                compact_column
-            )
-
-
-        return {
-            "rows":
-                result.get(
-                    "rows",
-                    0,
-                ),
-
-            "columns_count":
-                result.get(
-                    "columns_count",
-                    0,
-                ),
-
-            "total_missing":
-                result.get(
-                    "total_missing",
-                    0,
-                ),
-
-            "duplicate_rows":
-                result.get(
-                    "duplicate_rows",
-                    0,
-                ),
-
-            "duplicate_rows_to_remove":
-                result.get(
-                    "duplicate_rows_to_remove",
-                    0,
-                ),
-
-            "header_issues":
-                (
-                    result.get(
-                        "header_issues",
-                        []
-                    )
-                    or []
-                )[:8],
-
-            "columns":
-                compact_columns,
-        }
-
-
-    # ========================================================
-    # INSPECT COLUMN
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "inspect_column"
-    ):
-
-        compact = dict(
-            result
-        )
-
-
-        compact[
-            "sample_values"
-        ] = (
-            result.get(
-                "sample_values",
-                []
-            )
-            or []
-        )[:8]
-
-
-        top_values = (
-            result.get(
-                "top_values",
-                {}
-            )
-            or {}
-        )
-
-
-        compact[
-            "top_values"
-        ] = dict(
-            list(
-                top_values.items()
-            )[:6]
-        )
-
-
-        return compact
-
-
-    # ========================================================
-    # NUMERIC
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "detect_numeric_issues"
-    ):
-
-        compact = dict(
-            result
-        )
-
-
-        compact[
-            "examples_invalid"
-        ] = (
-            result.get(
-                "examples_invalid",
-                []
-            )
-            or []
-        )[:5]
-
-
-        compact[
-            "examples_values"
-        ] = (
-            result.get(
-                "examples_values",
-                []
-            )
-            or []
-        )[:6]
-
-
-        return compact
-
-
-    # ========================================================
-    # DATE
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "detect_date_issues"
-    ):
-
-        compact = dict(
-            result
-        )
-
-
-        compact[
-            "examples_invalid"
-        ] = (
-            result.get(
-                "examples_invalid",
-                []
-            )
-            or []
-        )[:5]
-
-
-        compact[
-            "examples_values"
-        ] = (
-            result.get(
-                "examples_values",
-                []
-            )
-            or []
-        )[:6]
-
-
-        return compact
-
-
-    # ========================================================
-    # TEXT
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "detect_text_anomalies"
-    ):
-
-        columns = []
-
-
-        for column in (
-            result.get(
-                "columns",
-                []
-            )
-            or []
-        ):
-
-            item = {
-                "column":
-                    column.get(
-                        "column"
-                    ),
-
-                "whitespace_count":
-                    column.get(
-                        "whitespace_count",
-                        0,
-                    ),
-
-                "null_like_count":
-                    column.get(
-                        "null_like_count",
-                        0,
-                    ),
-
-                "case_variant_groups":
-                    (
-                        column.get(
-                            "case_variant_groups",
-                            []
-                        )
-                        or []
-                    )[:4],
-
-                "examples_whitespace":
-                    (
-                        column.get(
-                            "examples_whitespace",
-                            []
-                        )
-                        or []
-                    )[:4],
-
-                "examples_null_like":
-                    (
-                        column.get(
-                            "examples_null_like",
-                            []
-                        )
-                        or []
-                    )[:4],
-            }
-
-
-            columns.append(
-                item
-            )
-
-
-        return {
-            "columns":
-                columns
-        }
-
-
-    # ========================================================
-    # DUPLICATES
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "find_duplicates"
-    ):
-
-        compact = dict(
-            result
-        )
-
-
-        if (
-            "examples"
-            in compact
-        ):
-
-            compact[
-                "examples"
-            ] = (
-                compact.get(
-                    "examples",
-                    []
-                )
-                or []
-            )[:4]
-
-
-        if (
-            "exact_examples"
-            in compact
-        ):
-
-            compact[
-                "exact_examples"
-            ] = (
-                compact.get(
-                    "exact_examples",
-                    []
-                )
-                or []
-            )[:3]
-
-
-        if (
-            "conflict_examples"
-            in compact
-        ):
-
-            compact[
-                "conflict_examples"
-            ] = (
-                compact.get(
-                    "conflict_examples",
-                    []
-                )
-                or []
-            )[:3]
-
-
-        return compact
-
-
-    # ========================================================
-    # EXTERNAL REFERENCE
-    # ========================================================
-
-    if (
-        tool_name
-        ==
-        "verify_external_reference"
-    ):
-
-        compact = dict(
-            result
-        )
-
-
-        compact[
-            "corrections"
-        ] = (
-            result.get(
-                "corrections",
-                []
-            )
-            or []
-        )[:15]
-
-
-        return compact
-
-
-    return result
-
-
-# ============================================================
-# TRACE -> COMPACT MEMORY
-# ============================================================
-
-def _build_evidence_memory(
-    trace,
-):
-    """
-    Transforme les anciens appels outils
-    en mémoire compacte.
-
-    Ainsi on ne renvoie pas toute la conversation
-    Tool → Agent → Tool → Agent à chaque tour.
-    """
-
-    if not trace:
-
+    compact = dict(result)
+
+    if tool_name == "inspect_column":
+        compact["sample_values"] = _head(result.get("sample_values"), 6)
+        compact["top_values"] = dict(list((result.get("top_values") or {}).items())[:8])
+    elif tool_name == "find_duplicates":
+        for key, limit in (("examples", 2), ("exact_examples", 2), ("conflict_examples", 2)):
+            if key in compact:
+                compact[key] = _head(compact.get(key), limit)
+    elif tool_name == "verify_external_reference":
+        compact["corrections"] = _head(result.get("corrections"), 20)
+
+    return compact
+
+
+def _build_evidence_memory(trace: list[dict]) -> str:
+    lines: list[str] = []
+    for item in trace or []:
+        if item.get("tool") in ("scan_all_columns", "baseline_plan", "coverage_check", "semantic_review"):
+            continue
+        if not item.get("memory_summary"):
+            continue
+        args = json.dumps(item.get("arguments", {}) or {}, ensure_ascii=False, separators=(",", ":"))
+        lines.append(f"{len(lines) + 1}. {item.get('tool')}({args}) -> {item['memory_summary']}")
+
+    if not lines:
         return ""
 
-
-    lines = [
-        (
-            "Evidence already gathered by tools. "
-            "Do not repeat a tool unless necessary:"
-        )
-    ]
+    memory = "\n".join(lines)
+    if len(memory) > MAX_EVIDENCE_CHARS:
+        memory = memory[-MAX_EVIDENCE_CHARS:]
+    return "TOOL EVIDENCE ALREADY GATHERED:\n" + memory
 
 
-    for index, item in enumerate(
-        trace,
-        start=1,
-    ):
-
-        tool = str(
-            item.get(
-                "tool",
-                "tool"
-            )
-        )
-
-
-        arguments = (
-            item.get(
-                "arguments",
-                {}
-            )
-            or {}
-        )
-
-
-        summary = str(
-            item.get(
-                "result_summary",
-                ""
-            )
-        )
-
-
-        arguments_text = (
-            json.dumps(
-                arguments,
-                ensure_ascii=False,
-                default=str,
-            )
-        )
-
-
-        line = (
-            f"{index}. {tool}"
-            f"({arguments_text})"
-            f" -> {summary}"
-        )
-
-
-        lines.append(
-            line
-        )
-
-
-    memory = "\n".join(
-        lines
-    )
-
-
-    if (
-        len(memory)
-        >
-        MAX_EVIDENCE_CHARS
-    ):
-
-        # Garder surtout les appels récents.
-        memory = (
-            memory[
-                -MAX_EVIDENCE_CHARS:
-            ]
-        )
-
-
-        memory = (
-            "Earlier evidence was compacted.\n"
-            +
-            memory
-        )
-
-
-    return memory
-
-
-# ============================================================
-# LATEST TOOL EXCHANGE
-# ============================================================
-
-def _latest_tool_exchange(
-    messages,
-):
-    """
-    Garde uniquement le DERNIER :
-
-        assistant(tool_calls)
-            +
-        tool results
-
-    Les anciens résultats passent dans
-    _build_evidence_memory().
-    """
-
-    last_assistant_index = None
-
-
-    for index in range(
-        len(messages) - 1,
-        -1,
-        -1,
-    ):
-
-        message = (
-            messages[
-                index
-            ]
-        )
-
-
-        if (
-            message.get(
-                "role"
-            )
-            ==
-            "assistant"
-
-            and
-
-            message.get(
-                "tool_calls"
-            )
-        ):
-
-            last_assistant_index = (
-                index
-            )
-
+def _latest_tool_exchange(messages: list[dict]) -> list[dict]:
+    last_index = None
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant" and messages[index].get("tool_calls"):
+            last_index = index
             break
-
-
-    if (
-        last_assistant_index
-        is None
-    ):
-
+    if last_index is None:
         return []
-
-
-    exchange = [
-        messages[
-            last_assistant_index
-        ]
-    ]
-
-
-    for message in (
-        messages[
-            last_assistant_index + 1:
-        ]
-    ):
-
-        if (
-            message.get(
-                "role"
-            )
-            ==
-            "tool"
-        ):
-
-            exchange.append(
-                message
-            )
-
-
+    exchange = [messages[last_index]]
+    exchange.extend(m for m in messages[last_index + 1:] if m.get("role") == "tool")
     return exchange
 
 
-# ============================================================
-# MODEL REQUEST MESSAGES
-# ============================================================
+def _build_request_messages(state: AgentState) -> list[dict]:
+    baseline_lines = summarize_actions(state.get("baseline_actions", []))
+    forms = json.dumps(state.get("open_decisions", {}), ensure_ascii=False, separators=(",", ":"))
 
-def _build_request_messages(
-    state,
-):
-    """
-    Construit une requête Groq compacte.
-
-    Au lieu de :
-
-        system
-        user
-        agent
-        tool
-        agent
-        tool
-        agent
-        tool
-        ...
-
-    on envoie :
-
-        system
-        user
-        evidence compactée
-        dernier échange tool
-    """
-
-    state_messages = list(
-        state.get(
-            "messages",
-            []
-        )
-    )
-
-
-    trace = list(
-        state.get(
-            "trace",
-            []
-        )
-    )
-
-
-    request_messages = [
-        {
-            "role":
-                "system",
-
-            "content":
-                SYSTEM_PROMPT,
-        },
-
-        {
-            "role":
-                "user",
-
-            "content":
-                (
-                    "Audit this dataset. "
-                    "Use tools only when they add evidence. "
-                    "The dataset stays local. "
-                    "When enough evidence has been collected, "
-                    "call submit_cleaning_plan exactly once."
-                ),
-        },
+    request = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": TASK_MESSAGE},
+        {"role": "user", "content": "BASELINE (already in the plan):\n" + "\n".join(baseline_lines)},
+        {"role": "user", "content": "CATEGORICAL FORMS (column -> form: count):\n" + forms},
     ]
 
-
-    evidence = (
-        _build_evidence_memory(
-            trace
-        )
-    )
-
-
+    evidence = _build_evidence_memory(state.get("trace", []))
     if evidence:
+        request.append({"role": "user", "content": evidence})
 
-        request_messages.append(
-            {
-                "role":
-                    "user",
-
-                "content":
-                    evidence,
-            }
-        )
-
-
-    latest_exchange = (
-        _latest_tool_exchange(
-            state_messages
-        )
-    )
-
-
-    request_messages.extend(
-        latest_exchange
-    )
-
-
-    return request_messages
+    request.extend(_latest_tool_exchange(list(state.get("messages", []))))
+    # Les anciens échanges sont compactés, mais la dernière consigne de reprise
+    # doit rester dans la requête réellement envoyée au modèle.
+    messages = list(state.get("messages", []))
+    if messages and messages[-1].get("role") == "user":
+        request.append(messages[-1])
+    if state.get("force_submission"):
+        request.append({
+            "role": "user",
+            "content": (
+                'Finish the semantic review now by calling submit_cleaning_plan. '
+                'If no extra mappings are justified, submit {"actions": []}. '
+                'Do not repeat inspections or return a plain-text conclusion.'
+            ),
+        })
+    return request
 
 
 # ============================================================
 # GRAPH
 # ============================================================
 
-def _build_graph(
-    runtime: ToolRuntime,
-):
+def _build_graph(runtime: ToolRuntime):
+    builder = StateGraph(AgentState)
 
-    builder = StateGraph(
-        AgentState
-    )
+    def agent_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        iterations = int(state.get("iterations", 0))
+        force_submission = bool(state.get("force_submission")) or iterations >= MAX_AGENT_TURNS - 1
 
-
-    # ========================================================
-    # AGENT NODE
-    # ========================================================
-
-    def agent_node(
-        state: AgentState,
-    ):
-
-        messages = list(
-            state.get(
-                "messages",
-                []
+        try:
+            request_state = {**state, "force_submission": force_submission}
+            response = call_agent_model(
+                runtime.client, _build_request_messages(request_state),
+                force_submission=force_submission,
             )
-        )
+        except Exception as exc:  # quota Groq, JSON invalide... : le plan de base reste valable
+            return {**state, "llm_error": f"{type(exc).__name__}: {exc}"}
 
+        messages.append(_assistant_message_to_dict(response.choices[0].message))
+        return {**state, "messages": messages, "iterations": iterations + 1}
 
-        iterations = int(
-            state.get(
-                "iterations",
-                0,
-            )
-        )
+    def tools_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        trace = list(state.get("trace", []))
+        plan = state.get("plan")
+        requirements = state.get("requirements", []) or []
+        identifier_columns = (state.get("findings") or {}).get("identifier_columns", [])
 
+        calls = list(messages[-1].get("tool_calls", []) or []) if messages else []
+        # Les outils d'inspection d'abord, la soumission du plan en dernier.
+        calls.sort(key=lambda c: c.get("function", {}).get("name") == "submit_cleaning_plan")
 
-        if (
-            iterations
-            >=
-            MAX_AGENT_TURNS
-        ):
-
-            return {
-                **state,
-
-                "error":
-                    (
-                        "L'agent a atteint la limite "
-                        "d'itérations sans soumettre "
-                        "de plan."
-                    ),
-            }
-
-
-        # IMPORTANT :
-        # on n'envoie plus tout l'historique.
-        request_messages = (
-            _build_request_messages(
-                state
-            )
-        )
-
-
-        response = (
-            call_agent_model(
-                runtime.client,
-                request_messages,
-            )
-        )
-
-
-        assistant = (
-            _assistant_message_to_dict(
-                response
-                .choices[0]
-                .message
-            )
-        )
-
-
-        messages.append(
-            assistant
-        )
-
-
-        return {
-            **state,
-
-            "messages":
-                messages,
-
-            "iterations":
-                iterations
-                +
-                1,
-        }
-
-
-    # ========================================================
-    # TOOL NODE
-    # ========================================================
-
-    def tools_node(
-        state: AgentState,
-    ):
-
-        messages = list(
-            state.get(
-                "messages",
-                []
-            )
-        )
-
-
-        trace = list(
-            state.get(
-                "trace",
-                []
-            )
-        )
-
-
-        plan = (
-            state.get(
-                "plan"
-            )
-        )
-
-
-        error = (
-            state.get(
-                "error"
-            )
-        )
-
-
-        if not messages:
-
-            return {
-                **state,
-                "error":
-                    "Aucun message agent disponible.",
-            }
-
-
-        assistant = (
-            messages[-1]
-        )
-
-
-        tool_calls = (
-            assistant.get(
-                "tool_calls",
-                []
-            )
-            or []
-        )
-
-
-        for call in (
-            tool_calls
-        ):
-
-            function_data = (
-                call.get(
-                    "function",
-                    {}
-                )
-            )
-
-
-            name = str(
-                function_data.get(
-                    "name",
-                    ""
-                )
-            )
-
-
-            raw_arguments = (
-                function_data.get(
-                    "arguments",
-                    "{}"
-                )
-                or "{}"
-            )
-
+        for call in calls:
+            function_data = call.get("function", {})
+            name = str(function_data.get("name", ""))
 
             try:
-
-                arguments = (
-                    json.loads(
-                        raw_arguments
+                arguments = json.loads(function_data.get("arguments", "{}") or "{}")
+                if not isinstance(arguments, dict):
+                    raise ValueError("Les arguments de l'outil doivent être un objet JSON.")
+                if name == "submit_cleaning_plan":
+                    # Ne pas transformer un JSON cassé ou un champ absent en
+                    # fausse revue réussie avec une liste vide.
+                    llm_actions = arguments.get("actions")
+                    if not isinstance(llm_actions, list) or any(not isinstance(a, dict) for a in llm_actions):
+                        raise ValueError("submit_cleaning_plan doit contenir une liste actions valide.")
+                    final, info = finalize_plan(
+                        state.get("baseline_actions", []), llm_actions, requirements, identifier_columns
                     )
-                )
+                    plan = {"actions": final}
 
-            except json.JSONDecodeError:
+                    trace.append({
+                        "tool": "semantic_review",
+                        "arguments": {"actions_proposed": len(llm_actions)},
+                        "result_summary": (
+                            f"{info['llm_actions_kept']} action(s) sémantique(s) retenue(s) · "
+                            f"plan final : {len(final)} actions"
+                        ),
+                        "memory_summary": "",
+                        "status": "ok",
+                    })
+                    trace.append({
+                        "tool": "coverage_check",
+                        "arguments": {},
+                        "result_summary": (
+                            "Toutes les anomalies détectées sont couvertes."
+                            if not info["auto_flagged"]
+                            else f"{info['auto_flagged']} anomalie(s) signalée(s) en revue humaine automatiquement."
+                        ),
+                        "memory_summary": "",
+                        "status": "ok" if not info["auto_flagged"] else "warning",
+                    })
+                    tool_content = json.dumps({"status": "accepted"})
 
-                arguments = {}
-
-
-            try:
-
-                full_result = (
-                    execute_tool(
-                        runtime,
-                        name,
-                        arguments,
+                else:
+                    full_result = execute_tool(runtime, name, arguments)
+                    compact_json = json.dumps(
+                        _compact_tool_result(name, full_result),
+                        ensure_ascii=False, default=str, separators=(",", ":"),
                     )
-                )
-
-
-                if (
-                    name
-                    ==
-                    "submit_cleaning_plan"
-                ):
-
-                    plan = (
-                        full_result
-                    )
-
-
-                compact_result = (
-                    _compact_tool_result(
-                        name,
-                        full_result,
-                    )
-                )
-
-
-                compact_json = (
-                    json.dumps(
-                        compact_result,
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                )
-
-
-                trace.append(
-                    {
-                        "tool":
-                            name,
-
-                        "arguments":
-                            arguments,
-
-                        "result_summary":
-                            compact_json[
-                                :700
-                            ],
-
-                        "status":
-                            "ok",
-                    }
-                )
-
-
-                # Le modèle reçoit la version compacte.
-                tool_content = (
-                    compact_json
-                )
-
+                    trace.append({
+                        "tool": name,
+                        "arguments": arguments,
+                        "result_summary": compact_json[:UI_RESULT_CHARS],
+                        "memory_summary": compact_json[:MEMORY_RESULT_CHARS],
+                        "status": "ok",
+                    })
+                    tool_content = compact_json
 
             except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                trace.append({
+                    "tool": name, "arguments": {"raw_arguments": function_data.get("arguments")},
+                    "result_summary": message, "memory_summary": message, "status": "error",
+                })
+                tool_content = json.dumps({"error": message, "tool": name}, ensure_ascii=False)
 
-                result = {
-                    "error":
-                        (
-                            f"{type(exc).__name__}: "
-                            f"{exc}"
-                        ),
+            messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": tool_content})
 
-                    "tool":
-                        name,
-                }
+        return {**state, "messages": messages, "trace": trace, "plan": plan}
 
+    def recovery_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        messages.append({
+            "role": "user",
+            "content": "Call submit_cleaning_plan now (an empty actions list is fine).",
+        })
+        return {**state, "messages": messages, "force_submission": True}
 
-                trace.append(
-                    {
-                        "tool":
-                            name,
+    def _limit_reached(state: AgentState) -> bool:
+        return int(state.get("iterations", 0)) >= MAX_AGENT_TURNS
 
-                        "arguments":
-                            arguments,
-
-                        "result_summary":
-                            result[
-                                "error"
-                            ],
-
-                        "status":
-                            "error",
-                    }
-                )
-
-
-                tool_content = (
-                    json.dumps(
-                        result,
-                        ensure_ascii=False,
-                    )
-                )
-
-
-                error = (
-                    result[
-                        "error"
-                    ]
-                )
-
-
-            messages.append(
-                {
-                    "role":
-                        "tool",
-
-                    "tool_call_id":
-                        call.get(
-                            "id"
-                        ),
-
-                    "content":
-                        tool_content,
-                }
-            )
-
-
-        return {
-            **state,
-
-            "messages":
-                messages,
-
-            "trace":
-                trace,
-
-            "plan":
-                plan,
-
-            "error":
-                error,
-        }
-
-
-    # ========================================================
-    # RECOVERY
-    # ========================================================
-
-    def recovery_node(
-        state: AgentState,
-    ):
-
-        messages = list(
-            state.get(
-                "messages",
-                []
-            )
-        )
-
-
-        messages.append(
-            {
-                "role":
-                    "user",
-
-                "content":
-                    (
-                        "Continue the audit. "
-                        "Do not repeat tools unnecessarily. "
-                        "When enough evidence exists, "
-                        "call submit_cleaning_plan."
-                    ),
-            }
-        )
-
-
-        return {
-            **state,
-
-            "messages":
-                messages,
-        }
-
-
-    # ========================================================
-    # ROUTING
-    # ========================================================
-
-    def route_after_agent(
-        state: AgentState,
-    ):
-
-        if (
-            state.get(
-                "error"
-            )
-            and
-            int(
-                state.get(
-                    "iterations",
-                    0,
-                )
-            )
-            >=
-            MAX_AGENT_TURNS
-        ):
-
+    def route_after_agent(state: AgentState):
+        if state.get("llm_error"):
             return "end"
-
-
-        messages = (
-            state.get(
-                "messages",
-                []
-            )
-        )
-
-
+        messages = state.get("messages", [])
         if not messages:
-
             return "end"
-
-
-        last = (
-            messages[-1]
-        )
-
-
-        if (
-            last.get(
-                "tool_calls"
-            )
-        ):
-
+        if messages[-1].get("tool_calls"):
+            # Une soumission au dernier tour doit encore être exécutée.
             return "tools"
-
-
-        if (
-            state.get(
-                "plan"
-            )
-            is not None
-        ):
-
+        if _limit_reached(state):
             return "end"
-
-
-        if (
-            int(
-                state.get(
-                    "iterations",
-                    0,
-                )
-            )
-            >=
-            MAX_AGENT_TURNS
-        ):
-
-            return "end"
-
-
         return "recovery"
 
-
-    def route_after_tools(
-        state: AgentState,
-    ):
-
-        if (
-            state.get(
-                "plan"
-            )
-            is not None
-        ):
-
+    def route_after_tools(state: AgentState):
+        if state.get("plan") is not None or _limit_reached(state):
             return "end"
-
-
-        if (
-            int(
-                state.get(
-                    "iterations",
-                    0,
-                )
-            )
-            >=
-            MAX_AGENT_TURNS
-        ):
-
-            return "end"
-
-
         return "agent"
 
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("recovery", recovery_node)
 
-    # ========================================================
-    # BUILD
-    # ========================================================
-
-    builder.add_node(
-        "agent",
-        agent_node,
-    )
-
-
-    builder.add_node(
-        "tools",
-        tools_node,
-    )
-
-
-    builder.add_node(
-        "recovery",
-        recovery_node,
-    )
-
-
-    builder.add_edge(
-        START,
-        "agent",
-    )
-
-
-    builder.add_conditional_edges(
-        "agent",
-
-        route_after_agent,
-
-        {
-            "tools":
-                "tools",
-
-            "recovery":
-                "recovery",
-
-            "end":
-                END,
-        },
-    )
-
-
-    builder.add_conditional_edges(
-        "tools",
-
-        route_after_tools,
-
-        {
-            "agent":
-                "agent",
-
-            "end":
-                END,
-        },
-    )
-
-
-    builder.add_edge(
-        "recovery",
-        "agent",
-    )
-
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "recovery": "recovery", "end": END})
+    builder.add_conditional_edges("tools", route_after_tools, {"agent": "agent", "end": END})
+    builder.add_edge("recovery", "agent")
 
     return builder.compile()
 
@@ -1458,117 +283,93 @@ def _build_graph(
 # RUN
 # ============================================================
 
-def run_data_cleaning_agent(
-    df,
-    api_key: str,
-):
+def run_data_cleaning_agent(df, api_key: str) -> dict:
+    # 1) Scan déterministe de TOUTES les colonnes (aucun appel LLM).
+    findings = scan_dataset(df)
+    requirements = build_requirements(findings)
 
-    client = (
-        create_client(
-            api_key
-        )
-    )
+    # 2) Plan de base déterministe : couvre toutes les anomalies mécaniques.
+    baseline = build_baseline(df, findings)
+    identifier_columns = findings.get("identifier_columns", [])
 
+    trace: list[dict] = [
+        {
+            "tool": "scan_all_columns",
+            "arguments": {},
+            "result_summary": digest_summary(findings, requirements),
+            "memory_summary": "",
+            "status": "ok",
+        },
+        *baseline["trace"],
+    ]
 
-    runtime = ToolRuntime(
-        df=df,
-        client=client,
-    )
+    plan = None
+    error = None
+    iterations = 0
 
+    # 3) Revue sémantique par le LLM (petite requête). Ignorée s'il n'y a rien à lui demander.
+    if baseline["open_decisions"]:
+        client = create_client(api_key)
+        runtime = ToolRuntime(df=df, client=client)
+        graph = _build_graph(runtime)
 
-    graph = (
-        _build_graph(
-            runtime
-        )
-    )
+        final_state = graph.invoke({
+            "messages": [],
+            "trace": trace,
+            "plan": None,
+            "error": None,
+            "iterations": 0,
+            "findings": findings,
+            "requirements": requirements,
+            "rejections": 0,
+            "baseline_actions": baseline["actions"],
+            "open_decisions": baseline["open_decisions"],
+            "llm_error": None,
+            "force_submission": False,
+        })
 
+        trace = final_state.get("trace", trace)
+        plan = final_state.get("plan")
+        iterations = final_state.get("iterations", 0)
 
-    initial_state: AgentState = {
+        if plan is None:
+            reason = final_state.get("llm_error") or (
+                f"aucune soumission valide de submit_cleaning_plan après {iterations} tour(s) ; "
+                "la revue sémantique n'a pas été finalisée"
+            )
+            trace.append({
+                "tool": "semantic_review",
+                "arguments": {},
+                "result_summary": f"Revue sémantique indisponible ({reason[:300]}) — plan de base conservé.",
+                "memory_summary": "",
+                "status": "warning",
+            })
+    else:
+        trace.append({
+            "tool": "semantic_review",
+            "arguments": {},
+            "result_summary": "Aucune décision sémantique nécessaire.",
+            "memory_summary": "",
+            "status": "ok",
+        })
 
-        "messages": [
-            {
-                "role":
-                    "system",
-
-                "content":
-                    SYSTEM_PROMPT,
-            },
-
-            {
-                "role":
-                    "user",
-
-                "content":
-                    (
-                        "Audit this dataset. "
-                        "Use tools dynamically based "
-                        "on evidence. "
-                        "The dataset stays local. "
-                        "Submit one final cleaning plan."
-                    ),
-            },
-        ],
-
-        "trace":
-            [],
-
-        "plan":
-            None,
-
-        "error":
-            None,
-
-        "iterations":
-            0,
-    }
-
-
-    final_state = (
-        graph.invoke(
-            initial_state
-        )
-    )
-
-
-    if (
-        final_state.get(
-            "plan"
-        )
-        is None
-        and
-        not final_state.get(
-            "error"
-        )
-    ):
-
-        final_state[
-            "error"
-        ] = (
-            "L'agent n'a pas soumis "
-            "de plan de nettoyage."
-        )
-
+    # 4) Plan final = plan de base (+ décisions du LLM si disponibles) + filet de sécurité.
+    if plan is None:
+        final, info = finalize_plan(baseline["actions"], [], requirements, identifier_columns)
+        plan = {"actions": final}
+        if info["auto_flagged"]:
+            trace.append({
+                "tool": "coverage_check",
+                "arguments": {},
+                "result_summary": f"{info['auto_flagged']} anomalie(s) signalée(s) en revue humaine automatiquement.",
+                "memory_summary": "",
+                "status": "warning",
+            })
 
     return {
-        "plan":
-            final_state.get(
-                "plan"
-            ),
-
-        "trace":
-            final_state.get(
-                "trace",
-                []
-            ),
-
-        "error":
-            final_state.get(
-                "error"
-            ),
-
-        "iterations":
-            final_state.get(
-                "iterations",
-                0,
-            ),
+        "plan": plan,
+        "trace": trace,
+        "error": error,
+        "iterations": iterations,
+        "coverage_requirements": requirements,
     }

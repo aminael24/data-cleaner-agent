@@ -41,9 +41,69 @@ html, body, [class*="css"] {
     padding-bottom: 6rem;
 }
 
+/* ---------- Header : on masque seulement Deploy / menu, PAS le bouton de la sidebar ---------- */
 #MainMenu {visibility: hidden;}
 footer {display: none;}
-[data-testid="stToolbar"] {visibility: hidden; height: 0;}
+
+[data-testid="stToolbarActions"],
+[data-testid="stMainMenu"],
+[data-testid="stDeployButton"],
+.stDeployButton {display: none !important;}
+
+/* Le bouton qui rouvre la sidebar doit rester visible et cliquable */
+[data-testid="stToolbar"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="stExpandSidebarButton"],
+[data-testid="collapsedControl"] {
+    visibility: visible !important;
+    display: flex !important;
+    z-index: 1000001 !important;
+}
+/* Boutons « » » / « « » de la sidebar : seulement l'icône en beige, sans fond */
+[data-testid="stSidebarCollapsedControl"] button,
+[data-testid="stExpandSidebarButton"],
+[data-testid="collapsedControl"] button,
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarHeader"] button {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    color: #F3E2C5 !important;
+}
+[data-testid="stSidebarCollapsedControl"] button:hover,
+[data-testid="stExpandSidebarButton"]:hover,
+[data-testid="collapsedControl"] button:hover,
+[data-testid="stSidebarCollapseButton"] button:hover,
+[data-testid="stSidebarHeader"] button:hover {
+    background: rgba(243,226,197,.12) !important;
+    color: #FFFFFF !important;
+}
+[data-testid="stSidebarCollapsedControl"] svg,
+[data-testid="stExpandSidebarButton"] svg,
+[data-testid="collapsedControl"] svg,
+[data-testid="stSidebarCollapseButton"] svg,
+[data-testid="stSidebarHeader"] button svg,
+[data-testid="stSidebarCollapsedControl"] [data-testid="stIconMaterial"],
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"],
+[data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"],
+[data-testid="stSidebarHeader"] button [data-testid="stIconMaterial"] {
+    color: #F3E2C5 !important;
+    fill: #F3E2C5 !important;
+}
+
+/* Quand la sidebar est FERMÉE, le bouton est sur fond clair : beige plus soutenu pour rester visible */
+[data-testid="stSidebarCollapsedControl"] button,
+[data-testid="stExpandSidebarButton"],
+[data-testid="collapsedControl"] button,
+[data-testid="stSidebarCollapsedControl"] svg,
+[data-testid="stExpandSidebarButton"] svg,
+[data-testid="collapsedControl"] svg,
+[data-testid="stSidebarCollapsedControl"] [data-testid="stIconMaterial"],
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"] {
+    color: #C79A4A !important;
+    fill: #C79A4A !important;
+}
 
 /* ---------- Sidebar ---------- */
 [data-testid="stSidebar"] {
@@ -81,6 +141,12 @@ footer {display: none;}
     background:rgba(255,255,255,.09)!important; color:#fff!important;
     border:1px solid rgba(255,255,255,.14)!important; border-radius:12px!important;
     min-height:42px; box-shadow:none!important;
+}
+
+/* Le contenu de la sidebar ne doit pas hériter des styles 3D de l'upload */
+[data-testid="stSidebar"] [data-testid="stFileUploader"] {
+    max-width: 100% !important;
+    perspective: none;
 }
 
 /* ---------- Hero ---------- */
@@ -125,29 +191,6 @@ footer {display: none;}
 @keyframes robotBubble {0%,8%{opacity:0; transform:translateY(6px) scale(.9)} 16%,70%{opacity:1; transform:none} 82%,100%{opacity:0; transform:translateY(-4px) scale(.95)}}
 @media (prefers-reduced-motion: reduce) {.robot-bubble {animation:none; opacity:1;}}
 
-/* Bouton natif Streamlit placé visuellement en bas à droite du hero */
-.st-key-hero_replace_dataset_button {
-    position: relative !important;
-    z-index: 20 !important;
-    margin-top: -112px !important;
-    margin-bottom: 54px !important;
-    padding-right: 18px !important;
-}
-.st-key-hero_replace_dataset_button button {
-    min-height: 48px !important;
-    border-radius: 14px !important;
-    border: 1px solid rgba(255,255,255,.30) !important;
-    background: rgba(255,255,255,.14) !important;
-    color: #fff !important;
-    font-weight: 760 !important;
-    box-shadow: 0 12px 28px rgba(0,0,0,.14) !important;
-    backdrop-filter: blur(10px) !important;
-}
-.st-key-hero_replace_dataset_button button:hover {
-    background: rgba(255,255,255,.26) !important;
-    border-color: rgba(255,255,255,.55) !important;
-    color: #fff !important;
-}
 
 /* ---------- Upload 3D animé (compact) ---------- */
 @property --angle {
@@ -513,11 +556,6 @@ section[data-testid="stFileUploaderDropzone"],
     .hero {padding:32px 26px 96px; min-height:0;}
     .arrow {display:none;}
     .step {padding:10px 16px; font-size:.78rem;}
-    .st-key-hero_replace_dataset_button {
-        margin-top: -98px !important;
-        margin-bottom: 38px !important;
-        padding-right: 8px !important;
-    }
 }
 @media (max-width: 600px) {
     .metrics-grid {grid-template-columns:1fr;}
@@ -612,14 +650,6 @@ section[data-testid="stFileUploaderDropzone"],
 .robot-bubble {
     background: var(--sand); color: var(--navy);
     border: 1px solid rgba(255,255,255,.7);
-}
-.st-key-hero_replace_dataset_button button {
-    border: 1px solid rgba(243,226,197,.55) !important;
-    background: rgba(243,226,197,.14) !important;
-}
-.st-key-hero_replace_dataset_button button:hover {
-    background: rgba(243,226,197,.32) !important;
-    border-color: rgba(243,226,197,.9) !important;
 }
 
 /* ---------- Étapes ---------- */
@@ -771,40 +801,54 @@ section[data-testid="stFileUploaderDropzone"],
 }
 
 /* =====================================================================
-   UPLOAD : état "fichier sélectionné" (puce + boutons + / ✕)
-   Les styles 3D du bouton Upload ne doivent pas s'appliquer ici.
+   UPLOAD : état "fichier chargé" (anciennes + nouvelles versions Streamlit)
+   Écrase le style 3D du bouton Upload pour les boutons « + », « ✕ », corbeille.
+   Détection de l'état : présence d'une puce de fichier dans l'uploader.
    ===================================================================== */
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) section[data-testid="stFileUploaderDropzone"],
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] {
+
+/* Zone compacte, sur une ligne, sans animation ni inclinaison */
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stFileUploaderDropzone"] {
     min-height: 0 !important;
-    padding: 12px 18px !important;
+    padding: 12px 16px !important;
     flex-direction: row !important;
+    flex-wrap: wrap !important;
     justify-content: center !important;
-    gap: 14px !important;
+    align-items: center !important;
+    gap: 12px !important;
     animation: none !important;
     transform: none !important;
     border: 2px solid rgba(226,196,143,.85) !important;
     background: linear-gradient(#FFFEFB, #FBF4E6) !important;
     box-shadow: 0 10px 26px rgba(4,32,74,.10) !important;
 }
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"]:hover {
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stFileUploaderDropzone"]:hover {
     transform: none !important;
 }
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] > div {
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stFileUploaderDropzone"] > div {
     width: auto !important;
     flex-direction: row !important;
 }
-/* boutons + et ✕ : petits, sobres, sans effet 3D */
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] button,
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"] {
+/* On cache le texte « Glissez-déposez » devenu inutile une fois le fichier chargé */
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stFileUploaderDropzoneInstructions"] {
+    display: none !important;
+}
+
+/* TOUS les boutons de l'état « fichier chargé » : petits, sobres, sans 3D */
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) button,
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stFileUploaderDropzone"] button,
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) [data-testid="stBaseButton-secondary"],
+[data-testid="stFileUploader"] [data-testid="stFileChipDeleteBtn"],
+[data-testid="stFileUploader"] [data-testid="stFileChipDeleteBtn"] button,
+[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button {
     order: 0 !important;
     min-width: 0 !important;
-    width: 38px !important;
-    min-height: 38px !important;
-    height: 38px !important;
+    width: 36px !important;
+    height: 36px !important;
+    min-height: 36px !important;
     padding: 0 !important;
     margin: 0 !important;
-    border-radius: 11px !important;
+    flex: 0 0 36px !important;
+    border-radius: 10px !important;
     background: rgba(11,47,94,.07) !important;
     color: var(--navy) !important;
     border: 1px solid rgba(11,47,94,.14) !important;
@@ -813,23 +857,40 @@ section[data-testid="stFileUploaderDropzone"],
     filter: none !important;
     transform: none !important;
 }
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] button:hover {
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) button:hover,
+[data-testid="stFileUploader"] [data-testid="stFileChipDeleteBtn"] button:hover {
     background: var(--sand) !important;
     border-color: var(--sand-deep) !important;
     transform: none !important;
     box-shadow: none !important;
 }
-[data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) [data-testid="stFileUploaderDropzone"] button svg {
+[data-testid="stFileUploader"]:has(:is([data-testid="stFileChip"], [data-testid="stFileChips"], [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileList"], [data-testid="stFileChipDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"])) button svg {
     color: var(--navy) !important;
-    fill: currentColor;
+    fill: currentColor !important;
+    width: 16px !important;
+    height: 16px !important;
 }
-/* puce du fichier : fond transparent, texte lisible */
+
+/* Puce du fichier : lisible, centrée, sans débordement */
+[data-testid="stFileChip"],
+[data-testid="stFileChips"],
 [data-testid="stFileUploaderFile"] {
     background: transparent !important;
-    max-width: none !important;
+    max-width: 100% !important;
+    width: auto !important;
     margin: 0 !important;
+    align-items: center !important;
 }
-[data-testid="stFileUploaderFileName"] {color: var(--navy) !important; font-weight: 700 !important;}
+[data-testid="stFileChipName"],
+[data-testid="stFileUploaderFileName"] {
+    color: var(--navy) !important;
+    font-weight: 700 !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 260px;
+}
+[data-testid="stFileChip"] small,
 [data-testid="stFileUploaderFile"] small {color: var(--muted) !important;}
 [data-testid="stFileUploaderFile"] [data-testid="stFileChipIcon"],
 [data-testid="stFileUploaderFile"] > div:first-child > div:first-child {
@@ -884,6 +945,27 @@ section[data-testid="stFileUploaderDropzone"],
 }
 @media (prefers-reduced-motion: reduce) {
     .arrow, .agent-dot::after, .feature-card {animation: none !important;}
+}
+
+/* =====================================================================
+   SIDEBAR : bouton "Nouveau dataset"
+   ===================================================================== */
+.st-key-sidebar_replace_dataset_button {margin-top: 12px;}
+.st-key-sidebar_replace_dataset_button button {
+    min-height: 46px !important;
+    border-radius: 13px !important;
+    background: rgba(243,226,197,.12) !important;
+    color: #fff !important;
+    border: 1px solid rgba(243,226,197,.45) !important;
+    font-weight: 760 !important;
+    box-shadow: none !important;
+    transition: background .2s ease, border-color .2s ease, transform .2s ease !important;
+}
+.st-key-sidebar_replace_dataset_button button:hover {
+    background: rgba(243,226,197,.26) !important;
+    border-color: rgba(243,226,197,.85) !important;
+    color: #fff !important;
+    transform: translateY(-2px);
 }
 </style>
 """

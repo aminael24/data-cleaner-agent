@@ -8,7 +8,7 @@ class CleaningPlanError(RuntimeError):
 
 
 DEFAULT_NULL_TOKENS = [
-    "", "na", "n/a", "null", "none", "nan", "unknown", "unk",
+    "", "na", "n/a", "null", "none", "nan", "unknown", "unk", "error", "err",
     "tbd", "-", "--", "?", "missing", "not available",
 ]
 
@@ -18,6 +18,7 @@ ALLOWED_OPERATIONS = {
     "drop_empty_rows",
     "drop_empty_columns",
     "drop_duplicate_rows",
+    "drop_duplicate_rows_after_cleaning",
     "drop_duplicates_by_columns",
     "replace_null_like",
     "strip_whitespace",
@@ -26,6 +27,8 @@ ALLOWED_OPERATIONS = {
     "to_numeric",
     "to_datetime",
     "set_negative_to_null",
+    "fill_missing_from_formula",
+    "recalculate_from_columns",
     "no_change",
 }
 
@@ -88,7 +91,7 @@ def _parse_numeric_value(value, decimal_comma=False):
         return pd.NA
 
     # Keep only numeric punctuation/sign; removes $, EUR, USD, spaces, etc.
-    text = re.sub(r"[^0-9,\.\-]", "", text)
+    text = re.sub(r"[^0-9,.\-]", "", text)
     if not text:
         return pd.NA
 
@@ -144,6 +147,13 @@ def _convert_numeric_series(series, decimal_comma=False):
     ).astype("Float64")
 
 
+def _as_numeric(series):
+    """Série numérique (Float64) quel que soit l'état actuel de la colonne."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    return _convert_numeric_series(series)
+
+
 def _convert_datetime_series(series, dayfirst=False):
     try:
         return pd.to_datetime(
@@ -160,6 +170,11 @@ def _count_changes(before, after):
     a = before.astype("string").fillna("<NA>")
     b = after.astype("string").fillna("<NA>")
     return int((a != b).sum())
+
+
+def _bool_mask(mask):
+    """Masque booléen sûr (les NA deviennent False)."""
+    return mask.fillna(False).astype(bool)
 
 
 def execute_cleaning_plan(original_df, plan):
@@ -217,6 +232,17 @@ def execute_cleaning_plan(original_df, plan):
             affected_count = before - len(df)
             details = f"{affected_count} ligne(s) dupliquée(s) supprimée(s)."
 
+        elif operation == "drop_duplicate_rows_after_cleaning":
+            # Exécutée APRÈS strip / casse / remplacements : supprime les doublons
+            # qui n'apparaissent qu'une fois les données normalisées.
+            before = len(df)
+            df = df.drop_duplicates().copy()
+            affected_count = before - len(df)
+            details = (
+                f"{affected_count} doublon(s) révélé(s) par le nettoyage supprimé(s) "
+                "(1re occurrence conservée)."
+            )
+
         elif operation == "drop_duplicates_by_columns":
             targets = resolve_target_columns(df, action, aliases)
             before = len(df)
@@ -225,7 +251,7 @@ def execute_cleaning_plan(original_df, plan):
             details = (
                 f"{affected_count} doublon(s) supprimé(s) selon "
                 + ", ".join(targets)
-                + "."
+                + " (1re occurrence conservée)."
             )
 
         elif operation == "strip_whitespace":
@@ -352,6 +378,90 @@ def execute_cleaning_plan(original_df, plan):
                 df.loc[mask, column] = pd.NA
                 affected_count += changed
             details = f"{affected_count} valeur(s) négative(s) remplacée(s) par NA."
+
+        elif operation == "fill_missing_from_formula":
+            # columns = [facteur_1, facteur_2, produit] avec produit = facteur_1 × facteur_2.
+            # Une case vide est remplie seulement si les DEUX autres valeurs de la ligne existent.
+            cols = resolve_target_columns(df, action, aliases)
+            if len(cols) != 3:
+                raise CleaningPlanError(
+                    "fill_missing_from_formula exige 3 colonnes : facteur 1, facteur 2, produit."
+                )
+            a_col, b_col, t_col = cols
+            a = _as_numeric(df[a_col])
+            b = _as_numeric(df[b_col])
+            t = _as_numeric(df[t_col])
+
+            def whole_only(series):
+                known = series.dropna()
+                return bool(len(known)) and bool((known % 1 == 0).all())
+
+            # Les 3 masques sont calculés sur les valeurs d'origine : aucun remplissage en chaîne.
+            fill_t = _bool_mask(t.isna() & a.notna() & b.notna())
+            fill_a = _bool_mask(a.isna() & t.notna() & b.notna() & (b != 0))
+            fill_b = _bool_mask(b.isna() & t.notna() & a.notna() & (a != 0))
+
+            new_t = (a * b).round(2)
+            new_a = t / b
+            new_b = t / a
+
+            # Une colonne d'entiers (ex. Quantity) n'accepte qu'un résultat entier.
+            if whole_only(a):
+                fill_a = fill_a & _bool_mask((new_a - new_a.round()).abs() < 1e-9)
+                new_a = new_a.round()
+            else:
+                new_a = new_a.round(2)
+            if whole_only(b):
+                fill_b = fill_b & _bool_mask((new_b - new_b.round()).abs() < 1e-9)
+                new_b = new_b.round()
+            else:
+                new_b = new_b.round(2)
+
+            df[a_col] = a.where(~fill_a, new_a)
+            df[b_col] = b.where(~fill_b, new_b)
+            df[t_col] = t.where(~fill_t, new_t)
+
+            n_a, n_b, n_t = int(fill_a.sum()), int(fill_b.sum()), int(fill_t.sum())
+            affected_count = n_a + n_b + n_t
+            details = (
+                f"{affected_count} case(s) vide(s) remplie(s) : "
+                f"{a_col}: {n_a}, {b_col}: {n_b}, {t_col}: {n_t}."
+            )
+
+        elif operation == "recalculate_from_columns":
+            # cible = source_1 × source_2, uniquement sur les lignes où les 3 valeurs existent
+            # et où l'écart dépasse la tolérance (2 %, même règle que le scan).
+            target = resolve_column(df, str(action.get("column", "") or "").strip(), aliases)
+            sources = [
+                resolve_column(df, str(c).strip(), aliases)
+                for c in (action.get("source_columns") or [])
+            ]
+            if len(sources) != 2:
+                raise CleaningPlanError(
+                    "recalculate_from_columns exige exactement 2 colonnes source."
+                )
+
+            left = _as_numeric(df[sources[0]])
+            right = _as_numeric(df[sources[1]])
+            actual = _as_numeric(df[target])
+
+            expected = left * right
+            tolerance = 0.02 * actual.abs().clip(lower=1)
+            mask = _bool_mask(
+                left.notna() & right.notna() & actual.notna()
+                & ((expected - actual).abs() > tolerance)
+            )
+
+            affected_count = int(mask.sum())
+            if affected_count:
+                updated = actual.copy()
+                updated[mask] = expected[mask].round(2)
+                df[target] = updated
+
+            details = (
+                f"{affected_count} valeur(s) de {target} recalculée(s) "
+                f"= {sources[0]} × {sources[1]}."
+            )
 
         elif operation == "no_change":
             affected_count = 0

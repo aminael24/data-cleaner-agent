@@ -14,6 +14,7 @@ from agent.graph import run_data_cleaning_agent
 from core.audit import profile_dataset, validate_post_cleaning
 from core.cleaning_engine import CleaningPlanError, execute_cleaning_plan
 from core.csv_loader import read_tabular_file
+from agent.quality import build_quality_report
 from ui.styles import CSS
 
 
@@ -259,7 +260,6 @@ def robot_html() -> str:
     )
 
 
-
 def svg_img(svg: str, cls: str = "") -> str:
     """Inline an animated SVG as <img> (st.html strips raw <svg>, <img> data URIs are kept)."""
     encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
@@ -384,6 +384,7 @@ def reset_analysis():
     st.session_state.cleaned_df = None
     st.session_state.execution_log = None
     st.session_state.validation_report = None
+    st.session_state.quality_report = None
     st.session_state.agent_error = None
     st.session_state.agent_run_id += 1
 
@@ -408,6 +409,7 @@ def operation_label(operation: str) -> str:
         "drop_empty_rows": "Lignes vides",
         "drop_empty_columns": "Colonnes vides",
         "drop_duplicate_rows": "Doublons complets",
+        "drop_duplicate_rows_after_cleaning": "Doublons après normalisation",   # nouveau
         "drop_duplicates_by_columns": "Doublons par identifiant",
         "replace_null_like": "Valeurs manquantes",
         "strip_whitespace": "Espaces superflus",
@@ -416,7 +418,9 @@ def operation_label(operation: str) -> str:
         "to_numeric": "Conversion numérique",
         "to_datetime": "Conversion des dates",
         "set_negative_to_null": "Valeurs négatives",
+        "recalculate_from_columns": "Recalcul depuis d'autres colonnes",         # nouveau
         "no_change": "Validation manuelle",
+        "fill_missing_from_formula": "Remplissage par calcul",
     }.get(operation, operation)
 
 
@@ -595,6 +599,8 @@ def centered_uploader(key: str, title: str, subtitle: str):
 def render_plan(plan: dict):
     actions = plan.get("actions", []) if isinstance(plan, dict) else []
     selected = []
+    manual = []  # actions no_change : informatives, rien à cocher
+    shown = 0
 
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
@@ -609,24 +615,32 @@ def render_plan(plan: dict):
         if confidence not in {"high", "medium", "low"}:
             confidence = "medium"
 
-        requires_review = bool(action.get("requires_review", False)) or operation == "no_change"
         label = operation_label(operation)
-        checkbox_label = label + (f" — {target}" if target else "")
+        reason = escape(str(action.get("reason", "") or ""))
+        target_html = f'<span class="plan-target">{escape(target)}</span>' if target else ""
 
-        checked = st.checkbox(
-            checkbox_label,
-            value=not requires_review,
-            key=f"plan_action_{st.session_state.agent_run_id}_{index}",
-        )
+        if operation == "no_change":
+            manual.append(
+                f"""
+                <div class="plan-card">
+                    <div class="plan-title">
+                        {target_html}
+                        <span class="badge badge-{confidence}">{escape(confidence.upper())}</span>
+                    </div>
+                    <div class="plan-reason">{reason}</div>
+                </div>
+                """
+            )
+            continue
 
-        target_html = (
-            f'<span class="plan-target">{escape(target)}</span>' if target else ""
-        )
+        requires_review = bool(action.get("requires_review", False))
+        shown += 1
 
         replacements_html = ""
         if operation == "replace_values":
             rows = []
-            for replacement in (action.get("replacements", []) or [])[:15]:
+            all_replacements = action.get("replacements", []) or []
+            for replacement in all_replacements[:15]:
                 if not isinstance(replacement, dict):
                     continue
                 old = escape(str(replacement.get("old_value", "")))
@@ -640,6 +654,11 @@ def render_plan(plan: dict):
                     </div>
                     """
                 )
+            if len(all_replacements) > 15:
+                rows.append(
+                    f'<div class="replacement-row"><span class="replacement-arrow">'
+                    f'… et {len(all_replacements) - 15} autres corrections</span></div>'
+                )
             if rows:
                 replacements_html = (
                     '<div class="replacement-box">'
@@ -648,27 +667,63 @@ def render_plan(plan: dict):
                     + "</div>"
                 )
 
-        html(
-            f"""
-            <div class="plan-card">
-                <div class="plan-top">
-                    <div class="plan-number">{index + 1}</div>
-                    <div class="plan-title">
-                        {escape(label)}
-                        {target_html}
-                        <span class="badge badge-{confidence}">{escape(confidence.upper())}</span>
+        review_html = '<span class="badge badge-low">À REVOIR</span>' if requires_review else ""
+
+        check_col, card_col = st.columns([0.06, 0.94], vertical_alignment="top")
+        with check_col:
+            checked = st.checkbox(
+                f"Appliquer l'action {shown}",
+                value=not requires_review,
+                key=f"plan_action_{st.session_state.agent_run_id}_{index}",
+                label_visibility="collapsed",
+            )
+        with card_col:
+            html(
+                f"""
+                <div class="plan-card">
+                    <div class="plan-top">
+                        <div class="plan-number">{shown}</div>
+                        <div class="plan-title">
+                            {escape(label)}
+                            {target_html}
+                            <span class="badge badge-{confidence}">{escape(confidence.upper())}</span>
+                            {review_html}
+                        </div>
                     </div>
+                    <div class="plan-reason">{reason}</div>
+                    {replacements_html}
                 </div>
-                <div class="plan-reason">{escape(str(action.get('reason', '') or ''))}</div>
-                {replacements_html}
-            </div>
-            """
-        )
+                """
+            )
 
         if checked:
             selected.append(action)
 
+    if manual:
+        with st.expander(f"⚠ Anomalies détectées ({len(manual)}) · non corrigées automatiquement", expanded=False):
+            for card in manual:
+                html(card)
+
     return selected
+
+
+def render_pre_execution_summary(plan: dict, selected: list, dataframe: pd.DataFrame):
+    """Récapitulatif avant exécution : rend visible ce qui va (ou non) être appliqué."""
+    all_actions = plan.get("actions", []) if isinstance(plan, dict) else []
+    dedupe_in_plan = any(a.get("operation") == "drop_duplicate_rows" for a in all_actions)
+    dedupe_selected = any(a.get("operation") == "drop_duplicate_rows" for a in selected)
+    exact = int(dataframe.duplicated().sum())
+    removed = exact if dedupe_selected else 0
+    reviewed = sum(1 for a in selected if a.get("requires_review"))
+
+    st.caption(
+        f"{len(selected)} action(s) sélectionnée(s), dont {reviewed} « à revoir » cochée(s) par vous · "
+        f"doublons exacts supprimés : {removed} · lignes finales attendues : {len(dataframe) - removed:,}"
+    )
+    if dedupe_in_plan and not dedupe_selected:
+        st.warning(
+            f"La case « Doublons complets » n'est pas cochée : {exact} doublon(s) exact(s) seront conservés."
+        )
 
 
 def render_trace(trace):
@@ -758,6 +813,50 @@ def render_post_validation(report: dict | None):
         )
 
 
+def render_quality_report(report: dict | None):
+    """Performance du nettoyage : même scan avant / après."""
+    if not report:
+        return
+
+    section(
+        "Performance",
+        "Performance du nettoyage",
+        "Le même audit complet est relancé sur le fichier d'origine et sur le fichier nettoyé. "
+        "Les anomalies « à revoir » (valeurs négatives, clés en conflit, incohérences entre colonnes) "
+        "ne sont pas corrigées automatiquement.",
+    )
+
+    html(
+        f"""
+        <div class="metrics-grid">
+            <div class="metric-card"><div class="metric-label">Anomalies avant</div><div class="metric-value">{report['before_total']:,}</div></div>
+            <div class="metric-card"><div class="metric-label">Anomalies après</div><div class="metric-value">{report['after_total']:,}</div></div>
+            <div class="metric-card"><div class="metric-label">Taux de résolution</div><div class="metric-value">{report['resolved_pct']}%</div></div>
+            <div class="metric-card"><div class="metric-label">Restent à revoir</div><div class="metric-value">{report['manual_after']:,}</div></div>
+        </div>
+        """
+    )
+
+    table = []
+    for row in report["rows"]:
+        if row["manual"]:
+            status = "À revoir"
+        elif row["before"] == 0:
+            status = "—"
+        else:
+            status = f"{max(row['before'] - row['after'], 0) / row['before']:.0%}"
+        table.append(
+            {"Catégorie": row["label"], "Avant": row["before"], "Après": row["after"], "Résolu": status}
+        )
+
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"Formes distinctes dans les colonnes catégorielles : {report['distinct_forms_before']} → "
+        f"{report['distinct_forms_after']} · Lignes : {report['rows_before']:,} → {report['rows_after']:,}"
+    )
+
+
 # ============================================================
 # SESSION STATE
 # ============================================================
@@ -778,6 +877,7 @@ DEFAULTS = {
     "cleaned_df": None,
     "execution_log": None,
     "validation_report": None,
+    "quality_report": None,
     "agent_error": None,
     "agent_run_id": 0,
 }
@@ -819,6 +919,18 @@ with st.sidebar:
             """
         )
 
+        # Unique point d'entrée pour remplacer le dataset
+        if st.button(
+            "↻ Nouveau dataset",
+            key="sidebar_replace_dataset_button",
+            use_container_width=True,
+            help="Importer un autre fichier. Le dataset actuel est conservé tant que le nouveau n'est pas valide.",
+        ):
+            st.session_state.replace_mode = True
+            st.session_state.replacement_version += 1
+            st.session_state.scroll_to_replace = True
+            st.rerun()
+
 
 # ============================================================
 # HERO
@@ -838,23 +950,6 @@ html(
     </div>
     """.replace("__ROBOT__", waves_html() + robot_html())
 )
-
-# Quand un dataset est déjà actif, on affiche UNE SEULE action de remplacement
-# directement dans la zone visuelle du Hero (en bas à droite).
-if st.session_state.df is not None:
-    hero_left, hero_action = st.columns([5.2, 1.45])
-
-    with hero_action:
-        if st.button(
-            "↻ Nouveau dataset",
-            key="hero_replace_dataset_button",
-            use_container_width=True,
-            help="Importer un autre fichier sans supprimer le dataset actuel tant que le nouveau n'est pas valide.",
-        ):
-            st.session_state.replace_mode = True
-            st.session_state.replacement_version += 1
-            st.session_state.scroll_to_replace = True
-            st.rerun()
 
 if not API_KEY:
     st.error("Ajoutez GROQ_API_KEY dans votre fichier .env puis relancez l'application.")
@@ -980,7 +1075,7 @@ section(
 
 if st.button("✦ Lancer l'agent Data Quality", type="primary", use_container_width=True):
     reset_analysis()
-    with st.spinner("L'agent inspecte le dataset et choisit ses outils..."):
+    with st.spinner("L'agent analyse le dataset (peut prendre jusqu'à 1 minute)..."):
         try:
             result = run_data_cleaning_agent(df, API_KEY)
             st.session_state.agent_result = result
@@ -1005,6 +1100,10 @@ if st.session_state.agent_result:
             </div>
             """
         )
+
+    for step in result.get("trace", []):
+        if step.get("status") == "warning":
+            st.warning(f"{step.get('tool')} : {step.get('result_summary')}")
 
     with st.expander("Voir la trace opérationnelle de l'agent"):
         st.caption(
@@ -1040,6 +1139,8 @@ if st.session_state.plan:
         ),
     )
 
+    render_pre_execution_summary(st.session_state.plan, selected, df)
+
     if st.button(
         "Appliquer les actions sélectionnées",
         type="primary",
@@ -1050,6 +1151,11 @@ if st.session_state.plan:
             filtered_plan = {"actions": selected}
             cleaned_df, log = execute_cleaning_plan(df, filtered_plan)
             validation_report = validate_post_cleaning(df, cleaned_df, log)
+            try:
+                with st.spinner("Calcul du rapport de performance..."):
+                    st.session_state.quality_report = build_quality_report(df, cleaned_df)
+            except Exception:
+                st.session_state.quality_report = None
 
             st.session_state.cleaned_df = cleaned_df
             st.session_state.execution_log = log
@@ -1073,10 +1179,16 @@ if st.session_state.cleaned_df is not None:
         "Comparez la structure brute au dataset nettoyé, puis exportez le résultat.",
     )
 
-    html(
-        f'<div class="success-banner">{check_icon()}'
-        '<span>Nettoyage terminé avec succès</span></div>'
-    )
+    report_status = str((st.session_state.validation_report or {}).get("status", "ok"))
+    if report_status == "ok":
+        html(
+            f'<div class="success-banner">{check_icon()}'
+            '<span>Nettoyage terminé avec succès</span></div>'
+        )
+    elif report_status == "warning":
+        st.warning("Nettoyage terminé · des points sont à vérifier dans la validation ci-dessous.")
+    else:
+        st.error("Nettoyage terminé · une régression potentielle est signalée, vérifiez la validation avant d'exporter.")
 
     before, after = st.columns(2)
     with before:
@@ -1105,11 +1217,14 @@ if st.session_state.cleaned_df is not None:
         """
     )
 
+    render_quality_report(st.session_state.quality_report)
+
     st.markdown("### Validation post-nettoyage")
     render_post_validation(st.session_state.validation_report)
 
-    st.markdown("### Journal d'exécution")
-    render_execution(st.session_state.execution_log)
+    log = st.session_state.execution_log or []
+    with st.expander(f"Journal d'exécution · {len(log)} actions", expanded=False):
+        render_execution(log)
 
     csv_standard = cleaned.to_csv(index=False).encode("utf-8-sig")
     csv_excel_fr = cleaned.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
